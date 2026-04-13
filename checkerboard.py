@@ -7,6 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
+import time
+from models.drifting import compute_drift, compute_drift_hybrid
+from models.model import MLP
+import argparse
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')   
 
@@ -17,35 +21,6 @@ def drifting_loss(gen: torch.Tensor, pos: torch.Tensor, compute_drift):
         target = (gen + V).detach()
     return F.mse_loss(gen, target)
 
-def compute_drift(gen: torch.Tensor, pos: torch.Tensor, temp: float = 0.05):
-    """
-    Compute drift field V with attention-based kernel.
-
-    Args:
-        gen: Generated samples [G, D]
-        pos: Data samples [P, D]
-        temp: Temperature for softmax kernel
-
-    Returns:
-        V: Drift vectors [G, D]
-    """
-    targets = torch.cat([gen, pos], dim=0)
-    G = gen.shape[0]
-
-    dist = torch.cdist(gen, targets)
-    dist[:, :G].fill_diagonal_(1e6)  # mask self
-    kernel = (-dist / temp).exp() # unnormalized kernel
-
-    normalizer = kernel.sum(dim=-1, keepdim=True) * kernel.sum(dim=-2, keepdim=True) # normalize along both dimensions, which we found to slightly improve performance
-    normalizer = normalizer.clamp_min(1e-12).sqrt()
-    normalized_kernel = kernel / normalizer
-
-    pos_coeff = normalized_kernel[:, G:] * normalized_kernel[:, :G].sum(dim=-1, keepdim=True)
-    pos_V = pos_coeff @ targets[G:]
-    neg_coeff = normalized_kernel[:, :G] * normalized_kernel[:, G:].sum(dim=-1, keepdim=True)
-    neg_V = neg_coeff @ targets[:G]
-
-    return pos_V - neg_V
 
 # ============================================================
 # Toy Dataset Samplers (minimal; copied from toy_mean_drift.py)
@@ -68,22 +43,10 @@ def sample_checkerboard(n: int, noise: float = 0.05, seed: int = 42) -> torch.Te
 # Training Loop for Toy 2D
 # ============================================================
 from functools import partial
-class MLP(nn.Module):
-    """MLP: noise -> output. 3 hidden layers with SiLU."""
-    def __init__(self, in_dim=32, hidden=256, out_dim=2):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, hidden), nn.SiLU(),
-            nn.Linear(hidden, out_dim),
-        )
-    def forward(self, z):
-        return self.net(z)
-
 def train_toy(sampler, steps=2000, data_batch_size=4096, 
               gen_batch_size=4096, lr=5e-4, temp=0.05,
-              in_dim=32, hidden=256, plot_every=2000, seed=42):
+              in_dim=32, hidden=256, plot_every=2000, kernel='Laplace', 
+              seed=42):
     """Train drifting model. Returns model and loss history."""
     torch.manual_seed(seed)
     model = MLP(in_dim=in_dim, hidden=hidden, out_dim=2).to(DEVICE)
@@ -92,10 +55,22 @@ def train_toy(sampler, steps=2000, data_batch_size=4096,
     loss_history = []
     ema = None
     pbar = tqdm(range(1, steps + 1))
+    strt_time = time.time()
     for step in pbar:
         pos = sampler(data_batch_size).to(DEVICE)
         gen = model(torch.randn(gen_batch_size, in_dim, device=DEVICE))
-        loss = drifting_loss(gen, pos, compute_drift=partial(compute_drift, temp=temp))
+
+        if kernel == 'Laplace':
+            loss = drifting_loss(gen, 
+                                 pos, 
+                                 compute_drift=partial(compute_drift, temp=temp))
+        elif kernel == 'Hybrid':
+            loss = drifting_loss(gen, 
+                                 pos, 
+                                 compute_drift=partial(compute_drift_hybrid, m=128, 
+                                                       sigma=0.1, laplace_scale=0.05, wc=1.0))
+        else:
+            raise ValueError(f"Unknown kernel: {kernel}")
 
         opt.zero_grad()
         loss.backward()
@@ -116,19 +91,35 @@ def train_toy(sampler, steps=2000, data_batch_size=4096,
             ax2.set_title(f'Generated (step {step})'); ax2.set_aspect('equal'); ax2.axis('off')
             plt.tight_layout()
             # save the plot
+            if os.path.exists('outputs_checkerboard') == False:
+                os.makedirs('outputs_checkerboard')
             plt.savefig(f'outputs_checkerboard/checkerboard_step_{step}.png', dpi=300)
             plt.close(fig)
-
+    end_time = time.time()
+    print(f"Training completed in {(end_time - strt_time)/60:.2f} minutes.")
     return model, loss_history
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--steps', type=int, default=10000)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--temp', type=float, default=0.05)
+    parser.add_argument('--in_dim', type=int, default=32)
+    parser.add_argument('--hidden', type=int, default=256)
+    parser.add_argument('--plot_every', type=int, default=2000)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--kernel', type=str, default='Laplace', choices=['Laplace', 'Hybrid'])
+    args = parser.parse_args()
+
     # Train on Checkerboard
     print("\nTraining on Checkerboard...")
     model_checker, loss_checker = train_toy(sample_checkerboard, 
-                                            steps=10000, 
-                                            lr=1e-3, 
-                                            temp=0.05)
+                                            steps=args.steps, 
+                                            lr=args.lr, 
+                                            temp=args.temp,
+                                            kernel=args.kernel,
+                                            )
 
     plt.figure(figsize=(6, 3))
     plt.plot(loss_checker, alpha=0.7)
